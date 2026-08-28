@@ -10,7 +10,13 @@ const Producto = require('./models/Producto');
 
 const app = express();
 
-app.use(cors());
+// Configuración de CORS para permitir peticiones desde GitHub Pages y entorno local
+app.use(cors({
+  origin: ['https://diazvb2506.github.io', 'http://localhost:5500', 'http://127.0.0.1:5500'],
+  methods: ['GET', 'POST', 'DELETE', 'PUT'],
+  credentials: true
+}));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -56,7 +62,7 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 } // Límite 50MB
 });
 
-// Conexión MongoDB con Pool
+// Conexión MongoDB con Pool (Usa MONGODB_URI)
 mongoose.connect(process.env.MONGODB_URI, {
   maxPoolSize: 10,
   serverSelectionTimeoutMS: 5000,
@@ -93,7 +99,7 @@ app.get('/api/productos', async (req, res) => {
   }
 });
 
-// API: GUARDAR REGISTRO (CON VALIDACIÓN DE CAMPOS Y PRECIO)
+// API: GUARDAR REGISTRO
 app.post('/api/productos', upload.single('archivo'), async (req, res) => {
   try {
     const { nombre, descripcion, precio, categoria } = req.body;
@@ -113,7 +119,10 @@ app.post('/api/productos', upload.single('archivo'), async (req, res) => {
       subcarpeta = 'documentos';
     }
 
-    const archivoUrl = `http://localhost:5000/uploads/${subcarpeta}/${req.file.filename}`;
+    // Detecta la URL pública de Render automáticamente en producción, o usa localhost en desarrollo
+    const PORT = process.env.PORT || 5000;
+    const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    const archivoUrl = `${baseUrl}/uploads/${subcarpeta}/${req.file.filename}`;
 
     // Manejo de precio seguro contra NaN
     let precioNumerico = null;
