@@ -174,16 +174,16 @@ app.post('/api/productos', upload.single('archivo'), async (req, res) => {
 });
 
 // ==========================================================================
-// API: ACTUALIZAR REGISTRO (EDICIÓN)
+// API: ACTUALIZAR REGISTRO (EDICIÓN OPTIMIZADA)
 // ==========================================================================
 app.put('/api/productos/:id', upload.single('archivo'), async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id ? req.params.id.trim() : '';
     const { nombre, descripcion, precio, categoria } = req.body;
 
     const productoExistente = await Producto.findById(id);
     if (!productoExistente) {
-      return res.status(404).json({ error: 'Registro no encontrado' });
+      return res.status(404).json({ error: 'Registro no encontrado en la base de datos' });
     }
 
     let precioNumerico = null;
@@ -191,13 +191,15 @@ app.put('/api/productos/:id', upload.single('archivo'), async (req, res) => {
       precioNumerico = parseFloat(precio);
     }
 
+    // Mantiene valores previos si un campo no viene definido en la petición
     const camposActualizar = {
-      nombre,
-      descripcion,
-      precio: precioNumerico,
-      categoria
+      nombre: nombre !== undefined ? nombre : productoExistente.nombre,
+      descripcion: descripcion !== undefined ? descripcion : productoExistente.descripcion,
+      precio: precioNumerico !== null ? precioNumerico : productoExistente.precio,
+      categoria: categoria !== undefined ? categoria : productoExistente.categoria
     };
 
+    // Procesar archivo únicamente si se sube uno nuevo
     if (req.file) {
       let tipoArchivo = 'imagen';
       let subcarpeta = 'fotos';
@@ -210,12 +212,17 @@ app.put('/api/productos/:id', upload.single('archivo'), async (req, res) => {
         subcarpeta = 'documentos';
       }
 
+      // Eliminar el archivo antiguo para evitar acumulación de espacio
       if (productoExistente.archivoUrl) {
-        const urlPath = new URL(productoExistente.archivoUrl, 'http://localhost').pathname;
-        const cleanOldPath = urlPath.replace(/^\//, '');
-        const oldFilePath = path.join(__dirname, cleanOldPath);
-        if (fs.existsSync(oldFilePath)) {
-          try { fs.unlinkSync(oldFilePath); } catch (e) { console.warn('No se pudo borrar archivo viejo:', e.message); }
+        try {
+          const urlPath = new URL(productoExistente.archivoUrl, 'http://localhost').pathname;
+          const cleanOldPath = urlPath.replace(/^\//, '');
+          const oldFilePath = path.join(__dirname, cleanOldPath);
+          if (fs.existsSync(oldFilePath)) {
+            fs.unlinkSync(oldFilePath);
+          }
+        } catch (e) {
+          console.warn('⚠️ No se pudo borrar el archivo anterior:', e.message);
         }
       }
 
@@ -233,8 +240,8 @@ app.put('/api/productos/:id', upload.single('archivo'), async (req, res) => {
     console.log('✏️ Publicación actualizada en BD:', productoActualizado.nombre);
     res.status(200).json({ mensaje: 'Publicación actualizada correctamente', producto: productoActualizado });
   } catch (error) {
-    console.error('Error al actualizar en BD:', error);
-    res.status(500).json({ error: 'Error al actualizar la publicación', detalle: error.message });
+    console.error('🔴 Error al actualizar en BD:', error);
+    res.status(500).json({ error: 'Error interno al actualizar la publicación', detalle: error.message });
   }
 });
 
@@ -243,7 +250,8 @@ app.put('/api/productos/:id', upload.single('archivo'), async (req, res) => {
 // ==========================================================================
 app.delete('/api/productos/:id', async (req, res) => {
   try {
-    const producto = await Producto.findByIdAndDelete(req.params.id);
+    const id = req.params.id ? req.params.id.trim() : '';
+    const producto = await Producto.findByIdAndDelete(id);
     if (!producto) return res.status(404).json({ error: 'Registro no encontrado' });
     
     if (producto.archivoUrl) {
