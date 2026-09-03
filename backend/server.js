@@ -10,13 +10,8 @@ const Producto = require('./models/Producto');
 
 const app = express();
 
-// Configuración de CORS para permitir peticiones desde GitHub Pages y entorno local
-app.use(cors({
-  origin: ['https://diazvb2506.github.io', 'http://localhost:5500', 'http://127.0.0.1:5500'],
-  methods: ['GET', 'POST', 'DELETE', 'PUT'],
-  credentials: true
-}));
-
+// Configuración CORS mejorada para producción
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -30,8 +25,14 @@ carpetas.forEach(dir => {
   }
 });
 
-// Servir estáticos
+// 1. SERVIR ARCHIVOS SUBIDOS (UPLOADS)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// 2. SERVIR ARCHIVOS ESTÁTICOS DEL FRONTEND (OPCIONAL EN MONOREPO LOCAL)
+const frontendPath = path.join(__dirname, '..', 'frontend');
+if (fs.existsSync(frontendPath)) {
+  app.use(express.static(frontendPath));
+}
 
 // Configuración de Multer
 const storage = multer.diskStorage({
@@ -48,11 +49,11 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'application/pdf'];
+  const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4', 'application/pdf'];
   if (allowedTypes.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error('Formato de archivo no permitido'), false);
+    cb(new Error('Formato de archivo no permitido. Solo se aceptan imágenes, MP4 o PDF.'), false);
   }
 };
 
@@ -62,16 +63,39 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 } // Límite 50MB
 });
 
-// Conexión MongoDB con Pool (Usa MONGODB_URI)
-mongoose.connect(process.env.MONGODB_URI, {
+// Conexión MongoDB
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/laserprint';
+
+mongoose.connect(MONGODB_URI, {
   maxPoolSize: 10,
   serverSelectionTimeoutMS: 5000,
   socketTimeoutMS: 45000,
 })
-.then(() => console.log('🟢 Base de Datos MongoDB profesional conectada'))
+.then(() => console.log('🟢 Base de Datos MongoDB conectada correctamente'))
 .catch(err => console.error('🔴 Error de conexión a BD:', err.message));
 
+// ==========================================================================
+// API: AUTENTICACIÓN (LOGIN)
+// ==========================================================================
+app.post('/api/login', (req, res) => {
+  const { usuario, password } = req.body;
+
+  if (usuario === '2025' && password === 'LaserPrint01') {
+    return res.status(200).json({ 
+      success: true, 
+      message: 'Autenticación exitosa' 
+    });
+  }
+
+  return res.status(401).json({ 
+    success: false, 
+    message: 'Usuario o contraseña incorrectos.' 
+  });
+});
+
+// ==========================================================================
 // API: OBTENER PRODUCTOS
+// ==========================================================================
 app.get('/api/productos', async (req, res) => {
   try {
     const { categoria, page = 1, limit = 100 } = req.query;
@@ -81,7 +105,7 @@ app.get('/api/productos', async (req, res) => {
 
     const productos = await Producto.find(filtro)
       .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
+      .skip((parseInt(page) - 1) * parseInt(limit))
       .limit(parseInt(limit))
       .lean();
 
@@ -99,7 +123,9 @@ app.get('/api/productos', async (req, res) => {
   }
 });
 
-// API: GUARDAR REGISTRO
+// ==========================================================================
+// API: GUARDAR REGISTRO NUEVO
+// ==========================================================================
 app.post('/api/productos', upload.single('archivo'), async (req, res) => {
   try {
     const { nombre, descripcion, precio, categoria } = req.body;
@@ -119,12 +145,8 @@ app.post('/api/productos', upload.single('archivo'), async (req, res) => {
       subcarpeta = 'documentos';
     }
 
-    // Detecta la URL pública de Render automáticamente en producción, o usa localhost en desarrollo
-    const PORT = process.env.PORT || 5000;
-    const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-    const archivoUrl = `${baseUrl}/uploads/${subcarpeta}/${req.file.filename}`;
+    const archivoUrl = `/uploads/${subcarpeta}/${req.file.filename}`;
 
-    // Manejo de precio seguro contra NaN
     let precioNumerico = null;
     if (precio !== undefined && precio !== null && precio !== '' && !isNaN(precio)) {
       precioNumerico = parseFloat(precio);
@@ -149,18 +171,117 @@ app.post('/api/productos', upload.single('archivo'), async (req, res) => {
   }
 });
 
-// API: ELIMINAR REGISTRO
+// ==========================================================================
+// API: ACTUALIZAR REGISTRO (EDICIÓN)
+// ==========================================================================
+app.put('/api/productos/:id', upload.single('archivo'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nombre, descripcion, precio, categoria } = req.body;
+
+    const productoExistente = await Producto.findById(id);
+    if (!productoExistente) {
+      return res.status(404).json({ error: 'Registro no encontrado' });
+    }
+
+    let precioNumerico = null;
+    if (precio !== undefined && precio !== null && precio !== '' && !isNaN(precio)) {
+      precioNumerico = parseFloat(precio);
+    }
+
+    const camposActualizar = {
+      nombre,
+      descripcion,
+      precio: precioNumerico,
+      categoria
+    };
+
+    if (req.file) {
+      let tipoArchivo = 'imagen';
+      let subcarpeta = 'fotos';
+
+      if (req.file.mimetype.startsWith('video/')) {
+        tipoArchivo = 'video';
+        subcarpeta = 'videos';
+      } else if (req.file.mimetype === 'application/pdf') {
+        tipoArchivo = 'pdf';
+        subcarpeta = 'documentos';
+      }
+
+      if (productoExistente.archivoUrl) {
+        const cleanOldPath = productoExistente.archivoUrl.replace(/^\//, '');
+        const oldFilePath = path.join(__dirname, cleanOldPath);
+        if (fs.existsSync(oldFilePath)) {
+          try { fs.unlinkSync(oldFilePath); } catch (e) { console.warn('No se pudo borrar archivo viejo:', e.message); }
+        }
+      }
+
+      camposActualizar.tipoArchivo = tipoArchivo;
+      camposActualizar.archivoUrl = `/uploads/${subcarpeta}/${req.file.filename}`;
+    }
+
+    const productoActualizado = await Producto.findByIdAndUpdate(
+      id,
+      camposActualizar,
+      { new: true, runValidators: true }
+    );
+
+    console.log('✏️ Publicación actualizada en BD:', productoActualizado.nombre);
+    res.status(200).json({ mensaje: 'Publicación actualizada correctamente', producto: productoActualizado });
+  } catch (error) {
+    console.error('Error al actualizar en BD:', error);
+    res.status(500).json({ error: 'Error al actualizar la publicación', detalle: error.message });
+  }
+});
+
+// ==========================================================================
+// API: ELIMINAR REGISTRO Y ARCHIVO FÍSICO
+// ==========================================================================
 app.delete('/api/productos/:id', async (req, res) => {
   try {
     const producto = await Producto.findByIdAndDelete(req.params.id);
     if (!producto) return res.status(404).json({ error: 'Registro no encontrado' });
+    
+    if (producto.archivoUrl) {
+      const cleanRelativePath = producto.archivoUrl.replace(/^\//, '');
+      const filePath = path.join(__dirname, cleanRelativePath);
+      
+      if (fs.existsSync(filePath)) {
+        try { fs.unlinkSync(filePath); } catch (e) { console.warn('Error al borrar archivo físico:', e.message); }
+      }
+    }
+
     res.status(200).json({ mensaje: 'Publicación eliminada correctamente' });
   } catch (error) {
     res.status(500).json({ error: 'Error al eliminar el registro' });
   }
 });
 
+// MIDDLEWARE DE CAPTURA DE ERRORES DE MULTER (Evita que caiga el server por formato/peso)
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({ error: `Error de subida: ${err.message}` });
+  } else if (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  next();
+});
+
+// FALLBACK DE RUTAS
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
+    return res.status(404).json({ error: 'Recurso API no encontrado' });
+  }
+  
+  const indexPath = path.join(__dirname, '..', 'frontend', 'index.html');
+  if (fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath);
+  }
+  
+  res.status(200).json({ status: 'API LaserPrint Operativa' });
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor listo en el puerto ${PORT}`);
+  console.log(`🚀 Servidor corriendo en el puerto ${PORT}`);
 });
