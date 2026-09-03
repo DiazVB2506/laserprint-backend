@@ -78,7 +78,8 @@ mongoose.connect(MONGODB_URI, {
 // API: AUTENTICACIÓN (LOGIN)
 // ==========================================================================
 app.post('/api/login', (req, res) => {
-  const { usuario, password } = req.body;
+  const usuario = req.body.usuario || req.body.username;
+  const password = req.body.password;
 
   if (usuario === '2025' && password === 'LaserPrint01') {
     return res.status(200).json({ 
@@ -145,7 +146,8 @@ app.post('/api/productos', upload.single('archivo'), async (req, res) => {
       subcarpeta = 'documentos';
     }
 
-    const archivoUrl = `/uploads/${subcarpeta}/${req.file.filename}`;
+    const hostUrl = process.env.RENDER_EXTERNAL_URL || `${req.protocol}://${req.get('host')}`;
+    const archivoUrl = `${hostUrl}/uploads/${subcarpeta}/${req.file.filename}`;
 
     let precioNumerico = null;
     if (precio !== undefined && precio !== null && precio !== '' && !isNaN(precio)) {
@@ -209,15 +211,17 @@ app.put('/api/productos/:id', upload.single('archivo'), async (req, res) => {
       }
 
       if (productoExistente.archivoUrl) {
-        const cleanOldPath = productoExistente.archivoUrl.replace(/^\//, '');
+        const urlPath = new URL(productoExistente.archivoUrl, 'http://localhost').pathname;
+        const cleanOldPath = urlPath.replace(/^\//, '');
         const oldFilePath = path.join(__dirname, cleanOldPath);
         if (fs.existsSync(oldFilePath)) {
           try { fs.unlinkSync(oldFilePath); } catch (e) { console.warn('No se pudo borrar archivo viejo:', e.message); }
         }
       }
 
+      const hostUrl = process.env.RENDER_EXTERNAL_URL || `${req.protocol}://${req.get('host')}`;
       camposActualizar.tipoArchivo = tipoArchivo;
-      camposActualizar.archivoUrl = `/uploads/${subcarpeta}/${req.file.filename}`;
+      camposActualizar.archivoUrl = `${hostUrl}/uploads/${subcarpeta}/${req.file.filename}`;
     }
 
     const productoActualizado = await Producto.findByIdAndUpdate(
@@ -243,11 +247,16 @@ app.delete('/api/productos/:id', async (req, res) => {
     if (!producto) return res.status(404).json({ error: 'Registro no encontrado' });
     
     if (producto.archivoUrl) {
-      const cleanRelativePath = producto.archivoUrl.replace(/^\//, '');
-      const filePath = path.join(__dirname, cleanRelativePath);
-      
-      if (fs.existsSync(filePath)) {
-        try { fs.unlinkSync(filePath); } catch (e) { console.warn('Error al borrar archivo físico:', e.message); }
+      try {
+        const urlPath = new URL(producto.archivoUrl, 'http://localhost').pathname;
+        const cleanRelativePath = urlPath.replace(/^\//, '');
+        const filePath = path.join(__dirname, cleanRelativePath);
+        
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+      } catch (e) {
+        console.warn('Error al borrar archivo físico:', e.message);
       }
     }
 
@@ -257,7 +266,7 @@ app.delete('/api/productos/:id', async (req, res) => {
   }
 });
 
-// MIDDLEWARE DE CAPTURA DE ERRORES DE MULTER (Evita que caiga el server por formato/peso)
+// MIDDLEWARE DE CAPTURA DE ERRORES DE MULTER
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     return res.status(400).json({ error: `Error de subida: ${err.message}` });
