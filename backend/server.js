@@ -1,304 +1,357 @@
+/**
+ * ==============================================================================
+ * DISEÑO LASER PRINT — API (server.js v2.0)
+ * ==============================================================================
+ *
+ * VARIABLES DE ENTORNO (se configuran en Render → Environment, NUNCA en el código):
+ *
+ *   MONGODB_URI            Conexión a MongoDB (ya la tienes)
+ *   ADMIN_USUARIO          Usuario del panel
+ *   ADMIN_PASSWORD         Contraseña del panel (usa una NUEVA)
+ *   SESSION_SECRET         Texto largo y aleatorio para firmar las sesiones
+ *                          (en Render usa el botón "Generate")
+ *   CLOUDINARY_CLOUD_NAME  ┐
+ *   CLOUDINARY_API_KEY     ├ Para guardar archivos en Cloudinary (recomendado:
+ *   CLOUDINARY_API_SECRET  ┘ el disco de Render se borra en cada reinicio)
+ *   ALLOWED_ORIGINS        (Opcional) dominios extra separados por coma
+ */
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const path = require('path');
-const multer = require('multer');
 const fs = require('fs');
+const crypto = require('crypto');
+const multer = require('multer');
 require('dotenv').config();
 
 const Producto = require('./models/Producto');
 
 const app = express();
+app.set('trust proxy', 1);          // Render está detrás de un proxy: así req.ip es la IP real
+app.disable('x-powered-by');
 
-// Configuración CORS mejorada para producción
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+/* ==========================================================================
+   1. CORS: solo tu sitio puede usar la API desde el navegador
+   ========================================================================== */
 
-// CREAR CARPETAS DE ALMACENAMIENTO AUTOMÁTICAMENTE SI NO EXISTEN
-const carpetas = ['uploads/fotos', 'uploads/videos', 'uploads/documentos'];
-carpetas.forEach(dir => {
-  const fullPath = path.join(__dirname, dir);
-  if (!fs.existsSync(fullPath)) {
-    fs.mkdirSync(fullPath, { recursive: true });
-    console.log(`📁 Carpeta creada: ${dir}`);
-  }
+const ORIGENES_PERMITIDOS = [
+  'https://diazvb2506.github.io',
+  ...(process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean)
+];
+
+app.use(cors({
+  origin(origin, cb) {
+    // Sin "origin" = peticiones del mismo servidor, curl, apps. Las protege el login.
+    if (!origin) return cb(null, true);
+    const local = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+    cb(null, local || ORIGENES_PERMITIDOS.includes(origin));
+  },
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  maxAge: 86400
+}));
+
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
 });
 
-// 1. SERVIR ARCHIVOS SUBIDOS (UPLOADS)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+/* ==========================================================================
+   2. AUTENTICACIÓN (toda la lógica está en auth.js)
+   ========================================================================== */
 
-// 2. SERVIR ARCHIVOS ESTÁTICOS DEL FRONTEND (OPCIONAL EN MONOREPO LOCAL)
-const frontendPath = path.join(__dirname, '..', 'frontend');
-if (fs.existsSync(frontendPath)) {
-  app.use(express.static(frontendPath));
+const { crearAuth } = require('./auth');
+const auth = crearAuth();
+const requiereAdmin = auth.requiereAdmin;
+
+app.post('/api/login', auth.login);
+app.get('/api/auth/verificar', requiereAdmin, auth.verificar);
+
+/* ==========================================================================
+   3. ALMACENAMIENTO DE ARCHIVOS
+   - Con Cloudinary configurado: los archivos se guardan ahí y no se pierden.
+   - Sin Cloudinary: se guardan en el disco del servidor (en Render gratis
+     se BORRAN en cada reinicio o despliegue).
+   ========================================================================== */
+
+const TIPOS_PERMITIDOS = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4', 'application/pdf'];
+
+function clasificar(mimetype) {
+  if (mimetype.startsWith('video/')) return { tipoArchivo: 'video', carpeta: 'videos', recurso: 'video' };
+  if (mimetype === 'application/pdf') return { tipoArchivo: 'pdf', carpeta: 'documentos', recurso: 'raw' };
+  return { tipoArchivo: 'imagen', carpeta: 'fotos', recurso: 'image' };
 }
 
-// Configuración de Multer
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    let folder = 'fotos';
-    if (file.mimetype.startsWith('video/')) folder = 'videos';
-    if (file.mimetype === 'application/pdf') folder = 'documentos';
-    cb(null, path.join(__dirname, `uploads/${folder}`));
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
+const nombreUnico = () => Date.now() + '-' + crypto.randomBytes(6).toString('hex');
+
+const USA_CLOUDINARY = Boolean(
+  process.env.CLOUDINARY_URL ||
+  (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET)
+);
+
+let cloudinary = null;
+let storage;
+
+if (USA_CLOUDINARY) {
+  cloudinary = require('cloudinary').v2;
+  const { CloudinaryStorage } = require('multer-storage-cloudinary');
+
+  if (!process.env.CLOUDINARY_URL) {
+    cloudinary.config({
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+      api_key: process.env.CLOUDINARY_API_KEY,
+      api_secret: process.env.CLOUDINARY_API_SECRET,
+      secure: true
+    });
+  }
+
+  storage = new CloudinaryStorage({
+    cloudinary,
+    params: async (req, file) => {
+      const info = clasificar(file.mimetype);
+      return {
+        folder: 'laserprint/' + info.carpeta,
+        resource_type: info.recurso,
+        // Los PDF se suben como "raw": el id necesita la extensión
+        public_id: nombreUnico() + (info.recurso === 'raw' ? '.pdf' : '')
+      };
+    }
+  });
+  console.log('☁️  Archivos: Cloudinary');
+} else {
+  ['fotos', 'videos', 'documentos'].forEach(dir => {
+    fs.mkdirSync(path.join(__dirname, 'uploads', dir), { recursive: true });
+  });
+
+  storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, path.join(__dirname, 'uploads', clasificar(file.mimetype).carpeta)),
+    filename: (req, file, cb) => cb(null, nombreUnico() + path.extname(file.originalname).toLowerCase())
+  });
+  console.warn('⚠️  Archivos: disco local. En Render gratis se borran en cada reinicio. Configura Cloudinary.');
+}
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    if (TIPOS_PERMITIDOS.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Formato no permitido. Solo imágenes (JPG, PNG, WEBP, GIF), MP4 o PDF.'));
   }
 });
 
-const fileFilter = (req, file, cb) => {
-  const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4', 'application/pdf'];
-  if (allowedTypes.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error('Formato de archivo no permitido. Solo se aceptan imágenes, MP4 o PDF.'), false);
+/** Datos del archivo recién subido, listos para guardar en la base de datos */
+function datosDeArchivo(req) {
+  const info = clasificar(req.file.mimetype);
+  if (USA_CLOUDINARY) {
+    return {
+      tipoArchivo: info.tipoArchivo,
+      archivoUrl: req.file.path,           // URL https de Cloudinary
+      archivoPublicId: req.file.filename,  // id para poder borrarlo después
+      archivoRecurso: info.recurso
+    };
   }
-};
+  const base = process.env.RENDER_EXTERNAL_URL || `${req.protocol}://${req.get('host')}`;
+  return {
+    tipoArchivo: info.tipoArchivo,
+    archivoUrl: `${base}/uploads/${info.carpeta}/${req.file.filename}`,
+    archivoPublicId: null,
+    archivoRecurso: null
+  };
+}
 
-const upload = multer({ 
-  storage, 
-  fileFilter,
-  limits: { fileSize: 50 * 1024 * 1024 } // Límite 50MB
-});
+/** Borra el archivo de un producto (Cloudinary o disco). Nunca lanza error. */
+async function borrarArchivo(producto) {
+  if (!producto) return;
+  try {
+    if (producto.archivoPublicId && cloudinary) {
+      await cloudinary.uploader.destroy(producto.archivoPublicId, {
+        resource_type: producto.archivoRecurso || 'image',
+        invalidate: true
+      });
+      return;
+    }
+    if (producto.archivoUrl) {
+      const ruta = new URL(producto.archivoUrl, 'http://localhost').pathname;
+      if (!ruta.startsWith('/uploads/')) return;
+      const carpetaUploads = path.join(__dirname, 'uploads');
+      const archivo = path.resolve(__dirname, '.' + decodeURIComponent(ruta));
+      // Solo borra dentro de /uploads (evita rutas como ../../)
+      if (archivo.startsWith(carpetaUploads + path.sep) && fs.existsSync(archivo)) fs.unlinkSync(archivo);
+    }
+  } catch (e) {
+    console.warn('⚠️  No se pudo borrar el archivo:', e.message);
+  }
+}
 
-// Conexión MongoDB
+/** Si algo falla después de subir, borra el archivo para no dejar basura */
+async function limpiarSubida(req) {
+  if (!req.file) return;
+  const d = datosDeArchivo(req);
+  await borrarArchivo(d);
+}
+
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'), { maxAge: '7d' }));
+
+/* ==========================================================================
+   4. BASE DE DATOS
+   ========================================================================== */
+
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/laserprint';
 
 mongoose.connect(MONGODB_URI, {
   maxPoolSize: 10,
   serverSelectionTimeoutMS: 5000,
-  socketTimeoutMS: 45000,
+  socketTimeoutMS: 45000
 })
-.then(() => console.log('🟢 Base de Datos MongoDB conectada correctamente'))
-.catch(err => console.error('🔴 Error de conexión a BD:', err.message));
+  .then(() => console.log('🟢 MongoDB conectada'))
+  .catch(err => console.error('🔴 Error de conexión a MongoDB:', err.message));
 
-// ==========================================================================
-// API: AUTENTICACIÓN (LOGIN)
-// ==========================================================================
-app.post('/api/login', (req, res) => {
-  const usuario = req.body.usuario || req.body.username;
-  const password = req.body.password;
+const esIdValido = (id) => mongoose.Types.ObjectId.isValid(id);
 
-  if (usuario === '2025' && password === 'LaserPrint01') {
-    return res.status(200).json({ 
-      success: true, 
-      message: 'Autenticación exitosa' 
-    });
-  }
+function precioDesde(valor) {
+  if (valor === undefined || valor === null || String(valor).trim() === '') return null;
+  const n = Number(valor);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
 
-  return res.status(401).json({ 
-    success: false, 
-    message: 'Usuario o contraseña incorrectos.' 
-  });
-});
+/* ==========================================================================
+   5. API DE PRODUCTOS
+   ========================================================================== */
 
-// ==========================================================================
-// API: OBTENER PRODUCTOS
-// ==========================================================================
+// Público: lo usan el inicio y las páginas de cada sección
 app.get('/api/productos', async (req, res) => {
   try {
-    const { categoria, page = 1, limit = 100 } = req.query;
-    
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 100));
+
     const filtro = { activo: true };
-    if (categoria) filtro.categoria = categoria;
+    if (req.query.categoria) filtro.categoria = String(req.query.categoria).toUpperCase();
 
-    const productos = await Producto.find(filtro)
-      .sort({ createdAt: -1 })
-      .skip((parseInt(page) - 1) * parseInt(limit))
-      .limit(parseInt(limit))
-      .lean();
+    const [productos, total] = await Promise.all([
+      Producto.find(filtro)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .select('-archivoPublicId -archivoRecurso -__v')
+        .lean(),
+      Producto.countDocuments(filtro)
+    ]);
 
-    const total = await Producto.countDocuments(filtro);
-
-    res.status(200).json({
-      total,
-      paginaActual: parseInt(page),
-      totalPaginas: Math.ceil(total / limit),
-      productos
-    });
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json({ total, paginaActual: page, totalPaginas: Math.ceil(total / limit), productos });
   } catch (error) {
-    console.error('Error al obtener productos:', error);
-    res.status(500).json({ error: 'Error al consultar catálogo', detalle: error.message });
+    console.error('Error al obtener productos:', error.message);
+    res.status(500).json({ error: 'Error al consultar el catálogo.' });
   }
 });
 
-// ==========================================================================
-// API: GUARDAR REGISTRO NUEVO
-// ==========================================================================
-app.post('/api/productos', upload.single('archivo'), async (req, res) => {
+// Protegido: crear
+app.post('/api/productos', requiereAdmin, upload.single('archivo'), async (req, res) => {
   try {
-    const { nombre, descripcion, precio, categoria } = req.body;
-    
-    if (!req.file) {
-      return res.status(400).json({ error: 'Debes seleccionar un archivo válido' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'Debes seleccionar un archivo válido.' });
 
-    let tipoArchivo = 'imagen';
-    let subcarpeta = 'fotos';
-
-    if (req.file.mimetype.startsWith('video/')) {
-      tipoArchivo = 'video';
-      subcarpeta = 'videos';
-    } else if (req.file.mimetype === 'application/pdf') {
-      tipoArchivo = 'pdf';
-      subcarpeta = 'documentos';
-    }
-
-    const hostUrl = process.env.RENDER_EXTERNAL_URL || `${req.protocol}://${req.get('host')}`;
-    const archivoUrl = `${hostUrl}/uploads/${subcarpeta}/${req.file.filename}`;
-
-    let precioNumerico = null;
-    if (precio !== undefined && precio !== null && precio !== '' && !isNaN(precio)) {
-      precioNumerico = parseFloat(precio);
-    }
-
-    const nuevoProducto = new Producto({
+    const { nombre, descripcion, categoria } = req.body;
+    const producto = await Producto.create({
       nombre,
       descripcion,
-      precio: precioNumerico,
       categoria,
-      tipoArchivo,
-      archivoUrl
+      precio: precioDesde(req.body.precio),
+      ...datosDeArchivo(req)
     });
 
-    await nuevoProducto.save();
-    console.log('✅ Publicación guardada en BD:', nuevoProducto.nombre);
-    
-    res.status(201).json({ mensaje: 'Publicación guardada exitosamente', producto: nuevoProducto });
+    console.log('✅ Publicación creada:', producto.nombre);
+    res.status(201).json({ mensaje: 'Publicación guardada.', producto });
   } catch (error) {
-    console.error('Error al guardar en BD:', error);
-    res.status(400).json({ error: 'Error de validación al guardar', detalle: error.message });
+    await limpiarSubida(req);
+    const esValidacion = error.name === 'ValidationError';
+    console.error('Error al guardar:', error.message);
+    res.status(esValidacion ? 400 : 500).json({
+      error: esValidacion ? Object.values(error.errors).map(e => e.message).join(' ') : 'Error al guardar la publicación.'
+    });
   }
 });
 
-// ==========================================================================
-// API: ACTUALIZAR REGISTRO (EDICIÓN OPTIMIZADA)
-// ==========================================================================
-app.put('/api/productos/:id', upload.single('archivo'), async (req, res) => {
+// Protegido: editar
+app.put('/api/productos/:id', requiereAdmin, upload.single('archivo'), async (req, res) => {
   try {
-    const id = req.params.id ? req.params.id.trim() : '';
-    const { nombre, descripcion, precio, categoria } = req.body;
+    const id = String(req.params.id || '').trim();
+    if (!esIdValido(id)) { await limpiarSubida(req); return res.status(400).json({ error: 'ID no válido.' }); }
 
-    const productoExistente = await Producto.findById(id);
-    if (!productoExistente) {
-      return res.status(404).json({ error: 'Registro no encontrado en la base de datos' });
-    }
+    const existente = await Producto.findById(id);
+    if (!existente) { await limpiarSubida(req); return res.status(404).json({ error: 'Publicación no encontrada.' }); }
 
-    let precioNumerico = null;
-    if (precio !== undefined && precio !== null && precio !== '' && !isNaN(precio)) {
-      precioNumerico = parseFloat(precio);
-    }
+    const { nombre, descripcion, categoria } = req.body;
+    if (nombre !== undefined) existente.nombre = nombre;
+    if (descripcion !== undefined) existente.descripcion = descripcion;
+    if (categoria !== undefined) existente.categoria = categoria;
+    // Precio vacío = quitar el precio (antes no se podía borrar)
+    if (req.body.precio !== undefined) existente.precio = precioDesde(req.body.precio);
 
-    // Mantiene valores previos si un campo no viene definido en la petición
-    const camposActualizar = {
-      nombre: nombre !== undefined ? nombre : productoExistente.nombre,
-      descripcion: descripcion !== undefined ? descripcion : productoExistente.descripcion,
-      precio: precioNumerico !== null ? precioNumerico : productoExistente.precio,
-      categoria: categoria !== undefined ? categoria : productoExistente.categoria
-    };
+    const anterior = { archivoUrl: existente.archivoUrl, archivoPublicId: existente.archivoPublicId, archivoRecurso: existente.archivoRecurso };
+    if (req.file) Object.assign(existente, datosDeArchivo(req));
 
-    // Procesar archivo únicamente si se sube uno nuevo
-    if (req.file) {
-      let tipoArchivo = 'imagen';
-      let subcarpeta = 'fotos';
+    await existente.save();
+    if (req.file) await borrarArchivo(anterior);   // el viejo se borra solo si todo salió bien
 
-      if (req.file.mimetype.startsWith('video/')) {
-        tipoArchivo = 'video';
-        subcarpeta = 'videos';
-      } else if (req.file.mimetype === 'application/pdf') {
-        tipoArchivo = 'pdf';
-        subcarpeta = 'documentos';
-      }
-
-      // Eliminar el archivo antiguo para evitar acumulación de espacio
-      if (productoExistente.archivoUrl) {
-        try {
-          const urlPath = new URL(productoExistente.archivoUrl, 'http://localhost').pathname;
-          const cleanOldPath = urlPath.replace(/^\//, '');
-          const oldFilePath = path.join(__dirname, cleanOldPath);
-          if (fs.existsSync(oldFilePath)) {
-            fs.unlinkSync(oldFilePath);
-          }
-        } catch (e) {
-          console.warn('⚠️ No se pudo borrar el archivo anterior:', e.message);
-        }
-      }
-
-      const hostUrl = process.env.RENDER_EXTERNAL_URL || `${req.protocol}://${req.get('host')}`;
-      camposActualizar.tipoArchivo = tipoArchivo;
-      camposActualizar.archivoUrl = `${hostUrl}/uploads/${subcarpeta}/${req.file.filename}`;
-    }
-
-    const productoActualizado = await Producto.findByIdAndUpdate(
-      id,
-      camposActualizar,
-      { new: true, runValidators: true }
-    );
-
-    console.log('✏️ Publicación actualizada en BD:', productoActualizado.nombre);
-    res.status(200).json({ mensaje: 'Publicación actualizada correctamente', producto: productoActualizado });
+    console.log('✏️  Publicación actualizada:', existente.nombre);
+    res.json({ mensaje: 'Publicación actualizada.', producto: existente });
   } catch (error) {
-    console.error('🔴 Error al actualizar en BD:', error);
-    res.status(500).json({ error: 'Error interno al actualizar la publicación', detalle: error.message });
+    await limpiarSubida(req);
+    const esValidacion = error.name === 'ValidationError';
+    console.error('Error al actualizar:', error.message);
+    res.status(esValidacion ? 400 : 500).json({
+      error: esValidacion ? Object.values(error.errors).map(e => e.message).join(' ') : 'Error al actualizar la publicación.'
+    });
   }
 });
 
-// ==========================================================================
-// API: ELIMINAR REGISTRO Y ARCHIVO FÍSICO
-// ==========================================================================
-app.delete('/api/productos/:id', async (req, res) => {
+// Protegido: eliminar
+app.delete('/api/productos/:id', requiereAdmin, async (req, res) => {
   try {
-    const id = req.params.id ? req.params.id.trim() : '';
+    const id = String(req.params.id || '').trim();
+    if (!esIdValido(id)) return res.status(400).json({ error: 'ID no válido.' });
+
     const producto = await Producto.findByIdAndDelete(id);
-    if (!producto) return res.status(404).json({ error: 'Registro no encontrado' });
-    
-    if (producto.archivoUrl) {
-      try {
-        const urlPath = new URL(producto.archivoUrl, 'http://localhost').pathname;
-        const cleanRelativePath = urlPath.replace(/^\//, '');
-        const filePath = path.join(__dirname, cleanRelativePath);
-        
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-        }
-      } catch (e) {
-        console.warn('Error al borrar archivo físico:', e.message);
-      }
-    }
+    if (!producto) return res.status(404).json({ error: 'Publicación no encontrada.' });
 
-    res.status(200).json({ mensaje: 'Publicación eliminada correctamente' });
+    await borrarArchivo(producto);
+    console.log('🗑️  Publicación eliminada:', producto.nombre);
+    res.json({ mensaje: 'Publicación eliminada.' });
   } catch (error) {
-    res.status(500).json({ error: 'Error al eliminar el registro' });
+    console.error('Error al eliminar:', error.message);
+    res.status(500).json({ error: 'Error al eliminar la publicación.' });
   }
 });
 
-// MIDDLEWARE DE CAPTURA DE ERRORES DE MULTER
+/* ==========================================================================
+   6. ESTADO, ERRORES Y RUTAS NO ENCONTRADAS
+   ========================================================================== */
+
+app.get('/', (req, res) => {
+  res.json({ status: 'API LaserPrint operativa', archivos: USA_CLOUDINARY ? 'cloudinary' : 'disco' });
+});
+
+// Errores de subida (archivo muy grande, formato no permitido…)
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
-    return res.status(400).json({ error: `Error de subida: ${err.message}` });
-  } else if (err) {
-    return res.status(400).json({ error: err.message });
+    const msg = err.code === 'LIMIT_FILE_SIZE' ? 'El archivo pesa más de 50 MB.' : `Error de subida: ${err.message}`;
+    return res.status(400).json({ error: msg });
+  }
+  if (err) {
+    console.error('Error:', err.message);
+    return res.status(400).json({ error: err.message || 'Petición no válida.' });
   }
   next();
 });
 
-// FALLBACK DE RUTAS
-app.get('*', (req, res) => {
-  if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
-    return res.status(404).json({ error: 'Recurso API no encontrado' });
-  }
-  
-  const indexPath = path.join(__dirname, '..', 'frontend', 'index.html');
-  if (fs.existsSync(indexPath)) {
-    return res.sendFile(indexPath);
-  }
-  
-  res.status(200).json({ status: 'API LaserPrint Operativa' });
+app.use((req, res) => {
+  res.status(404).json({ error: 'Recurso no encontrado.' });
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor corriendo en el puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Servidor en el puerto ${PORT}`));
