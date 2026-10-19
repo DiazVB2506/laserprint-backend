@@ -4,25 +4,25 @@ const ProductoSchema = new mongoose.Schema(
   {
     nombre: {
       type: String,
-      required: [true, 'El nombre del producto es obligatorio'],
+      required: [true, 'El nombre del producto es obligatorio.'],
       trim: true,
-      maxlength: [120, 'El nombre no puede exceder los 120 caracteres']
+      maxlength: [120, 'El nombre no puede pasar de 120 caracteres.']
     },
     descripcion: {
       type: String,
-      required: [true, 'La descripción es obligatoria'],
+      required: [true, 'La descripción es obligatoria.'],
       trim: true,
-      maxlength: [1000, 'La descripción no puede exceder los 1000 caracteres']
+      maxlength: [1000, 'La descripción no puede pasar de 1000 caracteres.']
     },
     precio: {
       type: Number,
       default: null,
-      min: [0, 'El precio no puede ser negativo'],
-      set: v => (v === null || v === undefined || isNaN(v) || v === '' ? null : Math.round(v * 100) / 100)
+      min: [0, 'El precio no puede ser negativo.'],
+      set: v => (v === null || v === undefined || v === '' || isNaN(v) ? null : Math.round(Number(v) * 100) / 100)
     },
     categoria: {
       type: String,
-      required: [true, 'La categoría es obligatoria'],
+      required: [true, 'La sección es obligatoria.'],
       uppercase: true,
       trim: true,
       enum: {
@@ -36,7 +36,7 @@ const ProductoSchema = new mongoose.Schema(
           'CORTELASER',
           'VINIL'
         ],
-        message: '{VALUE} no es una categoría válida'
+        message: '"{VALUE}" no es una sección válida.'
       },
       index: true
     },
@@ -47,8 +47,19 @@ const ProductoSchema = new mongoose.Schema(
     },
     archivoUrl: {
       type: String,
-      required: [true, 'La URL del archivo es obligatoria'],
+      required: [true, 'La URL del archivo es obligatoria.'],
       trim: true
+    },
+    // Datos internos para poder borrar el archivo de Cloudinary.
+    // No se envían al sitio público.
+    archivoPublicId: {
+      type: String,
+      default: null
+    },
+    archivoRecurso: {
+      type: String,
+      enum: ['image', 'video', 'raw', null],
+      default: null
     },
     activo: {
       type: Boolean,
@@ -63,27 +74,24 @@ const ProductoSchema = new mongoose.Schema(
   }
 );
 
-// ÍNDICES DE RENDIMIENTO
+// ÍNDICES
 ProductoSchema.index({ categoria: 1, createdAt: -1 });
 ProductoSchema.index({ activo: 1, categoria: 1 });
 ProductoSchema.index({ nombre: 'text', descripcion: 'text' });
 
-// VIRTUAL: Convierte URLs relativas a absolutas automáticamente para GitHub Pages
+// URL completa aunque se haya guardado una ruta relativa
 ProductoSchema.virtual('fullArchivoUrl').get(function () {
   if (!this.archivoUrl) return '';
-  if (this.archivoUrl.startsWith('http://') || this.archivoUrl.startsWith('https://')) {
-    return this.archivoUrl;
-  }
-  const baseUrl = process.env.RENDER_EXTERNAL_URL || 'https://laserprint-api.onrender.com';
-  const cleanPath = this.archivoUrl.startsWith('/') ? this.archivoUrl : `/${this.archivoUrl}`;
-  return `${baseUrl}${cleanPath}`;
+  if (/^https?:\/\//i.test(this.archivoUrl)) return this.archivoUrl;
+  const base = process.env.RENDER_EXTERNAL_URL || 'https://laserprint-api.onrender.com';
+  return base + (this.archivoUrl.startsWith('/') ? '' : '/') + this.archivoUrl;
 });
 
-// LIMPIEZA AL ENVIAR JSON AL FRONTEND
+// Limpieza al enviar JSON: quita campos internos y agrega "id"
 ProductoSchema.method('toJSON', function () {
-  const { __v, _id, ...object } = this.toObject();
-  object.id = _id;
-  return object;
+  const { __v, archivoPublicId, archivoRecurso, ...objeto } = this.toObject();
+  objeto.id = objeto._id;
+  return objeto;
 });
 
 module.exports = mongoose.model('Producto', ProductoSchema);
